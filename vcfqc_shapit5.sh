@@ -1,5 +1,229 @@
+# check input_vcf, REF, REF.fai existed
+# produce REF.fai :
+# bcftools faidx /CMUH_server/DataShare/REFERENCE/SEQ/UCSC/hg38/hg38.fa
+
+#!/bin/bash
+
+Help() {
+    echo "
+使用方法：
+  bash vcfqc_shapeit5.sh --input input.vcf.gz --output out_name --ref ref.fa --sex_file xxx.psam
+
+必要參數：
+  -i / --input        輸入 VCF
+  -o / --output       輸出命名
+
+可選參數：
+  -r / --ref          參考基因組 (預設 hg38)
+  -s / --sex_file     PSAM sex file (目前未用)
+"
+    exit 0
+}
+
+# === 參數解析 ===
+re='^(--help|-h)$'
+if [[ $1 =~ $re ]]; then
+    Help
+else
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -r|--ref) ref="$2"; shift 2;;
+            -i|--input) input="$2"; shift 2;;
+            -o|--output) output="$2"; shift 2;;
+            -s|--sex_file) sex_file="$2"; shift 2;;
+            *) echo "unknown option: $1" >&2; exit 1;;
+        esac
+    done
+
+    # === 檢查必要參數 ===
+    if [[ -z "$input" || -z "$output" ]]; then
+        echo "❌ 必要參數缺失，請確認 --input --output 是否有指定。" >&2
+        exit 1
+    fi
+    if [[ -z "$ref" ]]; then
+        ref="/CMUH_server/DataShare/REFERENCE/SEQ/UCSC/hg38/hg38.fa"
+    fi
+    if [[ -z "$sex_file" ]]; then
+        sex_file="/CMUH_server/home2/liuTY/stroke_plan_2021/TWBK_1484_allvariants.psam"
+    fi
+fi
+
+out_vcf1=/home/Weber/vcfQC/TWB_Drogen_vcfqc.vcf.gz
+
+bcftools norm -Ou -m -any ${input} |\
+  bcftools norm -Ou -f ${ref} |\
+  bcftools annotate -x ID -I +'%CHROM:%POS:%REF:%ALT' -O z -o ${out_vcf1}
+
+# 建立索引
+tabix -p vcf ${out_vcf1}
+
+# chrx.vcf
+bcftools view -r chrX \
+    ${out_vcf1} -Oz -o chrX.vcf.gz
+tabix -p vcf chrX.vcf.gz
+# 取 PAR 區域 (PAR1 + PAR2)
+bcftools view -r chrX:10001-2781479,chrX:155701383-156030895 chrX.vcf.gz -Oz -o chrX_PAR.vcf.gz
+tabix -p vcf chrX_PAR.vcf.gz
+# 取 nonPAR 區域 (整條 chrX 扣掉 PAR1, PAR2)
+bcftools view -r chrX chrX.vcf.gz | \
+    bcftools view -T ^<(echo -e "chrX\t10001\t2781479\nchrX\t155701383\t156030895") -Oz -o chrX_nonPAR.vcf.gz
+tabix -p vcf chrX_nonPAR.vcf.gz
+
+# out_vcf2=/home/Weber/vcfQC/TWB_Drogen_vcfqc_2.vcf.gz
+# bcftools filter -e 'FMT/GQ<20 | FMT/GT="mis"' -S . -Oz -o ${out_vcf2} ${out_vcf1}
+
+out_vcf2=/home/Weber/vcfQC/TWB_Drogen_vcfqc_2-2.vcf.gz
+bcftools +fill-tags ${out_vcf1} -Oz -o withDP.vcf.gz -- -t 'FORMAT/DP:1=int(smpl_sum(FORMAT/AD))'
+bcftools filter -e 'FMT/GQ<20 | FMT/DP<5 | FMT/GT="mis"' -S . withDP.vcf.gz | \
+  bcftools +fill-tags -Oz -o ${out_vcf2} -- -t F_MISSING,HWE,AF
+
+out_vcf_par1=chrX_PAR.vcf.gz
+out_vcf_par2=chrX_PAR_2.vcf.gz
+bcftools +fill-tags ${out_vcf_par1} -Oz -o PARwithDP.vcf.gz -- -t 'FORMAT/DP:1=int(smpl_sum(FORMAT/AD))'
+bcftools filter -e 'FMT/GQ<20 | FMT/DP<5 | FMT/GT="mis"' -S . PARwithDP.vcf.gz | \
+  bcftools +fill-tags -Oz -o ${out_vcf_par2} -- -t F_MISSING,HWE,AF
+tabix -p vcf ${out_vcf_par2}
+
+out_vcf_nopar1=chrX_nonPAR.vcf.gz
+out_vcf_nopar1_2=chrX_nonPAR_1_2.vcf.gz
+bcftools +fill-tags ${out_vcf_nopar1} \
+    -Oz -o noPARwithDP.vcf.gz \
+    -- -t 'FORMAT/DP:1=int(smpl_sum(FORMAT/AD))'
+tabix -p vcf noPARwithDP.vcf.gz
+
+# 過濾 + 填 F_MISSING, AF
+bcftools filter -e 'FMT/GQ<20 | FMT/DP<5 | FMT/GT="mis"' -S . noPARwithDP.vcf.gz \
+| bcftools +fill-tags -Oz -o ${out_vcf_nopar1_2} -- -t F_MISSING,AF
+tabix -p vcf ${out_vcf_nopar1_2}
+
+# 去除male
+awk 'NR>1 && $2==2 {print $1}' ${sex_file} > female_samples.txt
+bcftools view -S female_samples.txt ${out_vcf_nopar1_2} \
+    -Oz -o noPAR_flt_female.vcf.gz
+tabix -p vcf noPAR_flt_female.vcf.gz
+
+# female-only 算 HWE
+out_vcf_nopar2=chrX_nonPAR_2.vcf.gz
+bcftools +fill-tags noPAR_flt_female.vcf.gz \
+    -Oz -o ${out_vcf_nopar2} \
+    -- -t HWE
+tabix -p vcf ${out_vcf_nopar2}
+
+
+# 先把 male-only VCF 抽出來
+# sex_file=/CMUH_server/home2/liuTY/stroke_plan_2021/TWBK_1484_allvariants.psam
+# awk 'NR>1 && $2 == 1 {print $1}' ${sex_file} > male_samples.txt
+
+# bcftools view -S male_samples.txt ${out_vcf_nopar1_2} -Oz -o noPAR_flt_male.vcf.gz
+# tabix -p vcf noPAR_flt_male.vcf.gz
+
+# 合併 female (HWE) + male #合併會導致sample清單最後不一致
+# out_vcf_nopar2_2=chrX_nonPAR_merged.vcf.gz
+# bcftools merge -m all -Oz -o ${out_vcf_nopar2_2} ${out_vcf_nopar2} noPAR_flt_male.vcf.gz
+# tabix -p vcf ${out_vcf_nopar2_2}
+
+out_vcf_nopar2=chrX_nonPAR_2.vcf.gz
+out_vcf_nopar2_2=chrX_nonPAR_merged.vcf.gz
+# 抽出 HWE tag
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/HWE\n' ${out_vcf_nopar2} \
+  | bgzip -c > female_HWE.tsv.gz
+tabix -s1 -b2 -e2 female_HWE.tsv.gz
+
+# 把 HWE annotate 回 full nonPAR
+bcftools annotate -a female_HWE.tsv.gz -h <(echo '##INFO=<ID=HWE,Number=1,Type=Float,Description="Hardy-Weinberg Equilibrium from females only">') \
+  -c CHROM,POS,REF,ALT,INFO/HWE ${out_vcf_nopar1_2} -Oz -o ${out_vcf_nopar2_2}
+tabix -p vcf ${out_vcf_nopar2_2}
+
+# f_missing.py
+
+out_vcf2=/home/Weber/vcfQC/TWB_Drogen_vcfqc_2-2.vcf.gz
+out_vcf3=/home/Weber/vcfQC/TWB_Drogen_vcfqc_3.vcf.gz
+bcftools view -i "INFO/F_MISSING <= 0.1 & INFO/HWE >= 1e-6" \
+  ${out_vcf2} -Oz -o ${out_vcf3}
+
+out_vcf_par3=chrX_PAR_3.vcf.gz
+bcftools view -i "INFO/F_MISSING <= 0.1 & INFO/HWE >= 1e-6" \
+  ${out_vcf_par2} -Oz -o ${out_vcf_par3}
+tabix -p vcf ${out_vcf_par3}
+
+out_vcf_nopar3=chrX_nonPAR_3.vcf.gz
+bcftools view -i "INFO/F_MISSING <= 0.1 & INFO/HWE >= 1e-6" \
+  ${out_vcf_nopar2_2} -Oz -o ${out_vcf_nopar3}
+tabix -p vcf ${out_vcf_nopar3}
+
+
+# autosome.vcf
+bcftools view -r chr1,chr2,chr3,chr4,chr5,chr6,chr7,chr8,chr9,chr10,chr11,chr12,chr13,chr14,chr15,chr16,chr17,chr18,chr19,chr20,chr21,chr22 \
+    ${out_vcf3} -Oz -o autosome.vcf.gz
+tabix -p vcf autosome.vcf.gz
+
+
+bash extract_snp_info.sh autosome.vcf.gz chrX_PAR_3.vcf.gz chrX_nonPAR_3.vcf.gz combine_vcfqc_3_snp_info.tsv
+
+# plot_snp_qc.py
+python plot_snp_qc.py combine_vcfqc_3_snp_info.tsv
+
+# make stats_file
+# out_vcf3=/home/Weber/vcfQC/TWB_Drogen_vcfqc_3.vcf.gz
+# out_file=/home/Weber/vcfQC/stats_file.stats
+# bcftools stats -s - ${out_vcf3} > ${out_file}
+# plot-vcfstats -p ./stats_plots ${out_file}
+# bcftools concat：用在 同樣sample、不同染色體或區段 的情況。
+# bcftools merge：用來合併 同樣變異、不同sample 的 VCF。
+bash check_samples.sh autosome.vcf.gz chrX_PAR_3.vcf.gz chrX_nonPAR_3.vcf.gz
+bash bcf_stats.sh  #singleton graph
+
+python plot_sample_qc.py stats_file.stats
+
+out_vcf4=/home/Weber/vcfQC/TWB_Drogen_vcfqc_4.vcf.gz
+bcftools view -i "INFO/F_MISSING <= 0.01 & INFO/AF >= 0.05" vcfqc_final_merged.sorted.vcf.gz -O z -o ${out_vcf4}
+
+# relative
+out_vcf5=TWB_Drogen_vcfqc_3_relative.txt
+vcftools --gzvcf autosome.vcf.gz \
+  --relatedness2 \
+  --out ${out_vcf5}
+
+# machine type
+# platform_file=/CMUH_server/DATA7/SNParray/TWB2023/4.lab_info.csv
+# python platform_mix.py sample_qc_metrics.xlsx /CMUH_server/DATA7/SNParray/TWB2023/4.lab_info.csv
+# python plot_platform.py
+
+# sex_file=/CMUH_server/home2/liuTY/stroke_plan_2021/TWBK_1484_allvariants.psam
+python sex_mix.py
+
+# singleton sample counts
+python plot_singleton.py
+
+# 計算 singleton 數量
+bcftools view -i 'INFO/AC=1' vcfqc_final_merged.sorted.vcf.gz | bcftools view -H | wc -l
+
+# 移除 singleton SNP
+bcftools view -e 'INFO/AC=1' -Oz -o autosome_singletonremoved.vcf.gz autosome.vcf.gz
+tabix -p vcf autosome_singletonremoved.vcf.gz
+# X移除 singleton SNP
+bcftools concat \
+  -Oz -o chrX_merged.vcf.gz \
+  chrX_PAR_3.vcf.gz chrX_nonPAR_3.vcf.gz
+bcftools sort chrX_merged.vcf.gz -Oz -o chrX_merged.sorted.vcf.gz
+tabix -p vcf chrX_merged.sorted.vcf.gz
+bcftools view -e 'INFO/AC=1' -Oz -o chrX_merged_singletonremoved.vcf.gz chrX_merged.sorted.vcf.gz
+tabix -p vcf chrX_merged_singletonremoved.vcf.gz
+
+# 移除 singleton SNP
+bcftools view -e 'INFO/AC<2' -Oz -o autosome_singletonremoved2.vcf.gz autosome.vcf.gz
+tabix -p vcf autosome_singletonremoved2.vcf.gz
+# X移除 singleton SNP
+bcftools view -e 'INFO/AC<2' -Oz -o chrX_merged_singletonremoved2.vcf.gz chrX_merged.sorted.vcf.gz
+tabix -p vcf chrX_merged_singletonremoved2.vcf.gz
+
+# bcftools query -f '%FILTER\n' autosome_singletonremoved.vcf.gz | grep -v '^PASS$' | wc -l
+# bcftools query -f '%FILTER\n' chrX_merged_singletonremoved.vcf.gz | grep -v '^PASS$' | wc -l
+bcftools query -f '%FILTER\n' autosome_singletonremoved2.vcf.gz | grep -v '^PASS$' | wc -l
+bcftools query -f '%FILTER\n' chrX_merged_singletonremoved2.vcf.gz | grep -v '^PASS$' | wc -l
+
+
 # sex check
-sex_file=/CMUH_server/home2/liuTY/stroke_plan_2021/TWBK_1484_allvariants.psam
 bfile_name=chrX_singletonremoved
 plink2 --vcf chrX_merged_singletonremoved.vcf.gz \
   --update-sex ${sex_file} \
@@ -41,17 +265,15 @@ bcftools view -S <(bcftools query -l chrX_merged_singletonremoved2.vcf.gz | grep
   -Oz -o cleaned_chrX_merged_singletonremoved2.vcf.gz chrX_merged_singletonremoved2.vcf.gz
 tabix -p vcf cleaned_chrX_merged_singletonremoved2.vcf.gz
 
-# PCA
-
 
 # index查看每條染色體的變異數
 for chr in chr{1..22} chrX chrY chrM; do
   echo -ne "$chr\t"
-  bcftools view -r $chr TWB_Drogen_vcfqc.vcf.gz | bcftools view -H | wc -l
+  bcftools view -r $chr ${out_vcf1} | bcftools view -H | wc -l
 done
 for chr in chr{1..22} chrX; do
   echo -ne "$chr\t"
-  bcftools view -r $chr TWB_Drogen_vcfqc_3.vcf.gz | bcftools view -H | wc -l
+  bcftools view -r $chr ${out_vcf3} | bcftools view -H | wc -l
 done
 
 # autosome
@@ -112,25 +334,6 @@ for CHR in {1..22}; do
                 print "chr" chr ":" start_bp "-" last_bp
         }' > shapeit5/phasing/chr${CHR}.chunks.txt
 done
-# chr15需手動調整region大小(稀疏密集差太多)
-
-
-# 可能需要切開男女sample 記憶體爆炸
-# grep -v '^NGS20140610G[[:space:]]*' female_samples.txt > female_samples.new.txt
-
-# # female sample subset
-# for CHR in {1..22}; do
-#     echo "Extracting female chr${CHR}..."
-#     bcftools view -S female_samples.new.txt phasing/chr${CHR}.vcf.gz -Oz -o phasing/female.chr${CHR}.vcf.gz
-#     tabix -p vcf phasing/female.chr${CHR}.vcf.gz
-# done
-
-# # male sample subset
-# for CHR in {1..22}; do
-#     echo "Extracting male chr${CHR}..."
-#     bcftools view -S ^female_samples.new.txt phasing/chr${CHR}.vcf.gz -Oz -o phasing/male.chr${CHR}.vcf.gz
-#     tabix -p vcf phasing/male.chr${CHR}.vcf.gz
-# done
 
 
 # reference
@@ -148,55 +351,39 @@ done
 
 mkdir -p shapeit5/logs
 mkdir -p shapeit5/shapeit_chr
-for CHR in {1..6}; do
-    echo "Phasing chr${CHR}..."
-    MAP=/home/Weber/hg38_chr/chr${CHR}.chrprefix.b38.gmap.gz
-    while read REGION; do
-        echo "  REGION ${REGION}"
-        lines=$(bcftools view -r ${REGION} -H phasing/chr${CHR}.vcf.gz | wc -l)
-        echo " SNP count: $lines "
-        SHAPEIT5_phase_common \
-          --input phasing/chr${CHR}.vcf.gz \
-          --map ${MAP} \
-          --region ${REGION} \
-          --output /home/Weber/vcfQC/shapeit5/shapeit_chr/chr${CHR}_${REGION}.phased.bcf \
-          --thread 5 \
-          --log shapeit5/logs/chr${CHR}_${REGION}.log
-    done < <(cat shapeit5/phasing/chr${CHR}.chunks.txt)
-done
+#paralell
+for CHR in {1..22}; do
+    echo "==> Phasing chr${CHR} with GNU parallel..."
 
-for CHR in {7..13}; do
-    echo "Phasing chr${CHR}..."
-    MAP=/home/Weber/hg38_chr/chr${CHR}.chrprefix.b38.gmap.gz
-    while read REGION; do
-        echo "  REGION ${REGION}"
-        lines=$(bcftools view -r ${REGION} -H phasing/chr${CHR}.vcf.gz | wc -l)
-        echo " SNP count: $lines "
-        SHAPEIT5_phase_common \
-          --input phasing/chr${CHR}.vcf.gz \
-          --map ${MAP} \
-          --region ${REGION} \
-          --output /home/Weber/vcfQC/shapeit5/shapeit_chr/chr${CHR}_${REGION}.phased.bcf \
-          --thread 5 \
-          --log shapeit5/logs/chr${CHR}_${REGION}.log
-    done < <(cat shapeit5/phasing/chr${CHR}.chunks.txt)
-done
+    MAP="/home/Weber/hg38_chr/chr${CHR}.chrprefix.b38.gmap.gz"
+    INPUTVCF="phasing/chr${CHR}.vcf.gz"
+    CHUNKS="shapeit5/phasing/chr${CHR}.chunks.txt"
+    OUTDIR="shapeit5/shapeit_chr"
+    LOGDIR="shapeit5/logs"
+    THREAD=5
 
-for CHR in {13..22}; do
-    echo "Phasing chr${CHR}..."
-    MAP=/home/Weber/hg38_chr/chr${CHR}.chrprefix.b38.gmap.gz
-    while read REGION; do
+    export CHR MAP INPUT OUTDIR LOGDIR THREAD
+
+    parallel -j 10 --env CHR --env MAP --env INPUT --env OUTDIR --env LOGDIR --env THREAD '
+        REGION={}
+
         echo "  REGION ${REGION}"
-        lines=$(bcftools view -r ${REGION} -H phasing/chr${CHR}.vcf.gz | wc -l)
-        echo " SNP count: $lines "
-        SHAPEIT5_phase_common \
-          --input phasing/chr${CHR}.vcf.gz \
-          --map ${MAP} \
-          --region ${REGION} \
-          --output /home/Weber/vcfQC/shapeit5/shapeit_chr/chr${CHR}_${REGION}.phased.bcf \
-          --thread 5 \
-          --log shapeit5/logs/chr${CHR}_${REGION}.log
-    done < <(cat shapeit5/phasing/chr${CHR}.chunks.txt)
+        lines=$(bcftools view -r ${REGION} -H "${INPUTVCF}" | wc -l)
+        echo "  SNP count: $lines"
+
+        if [ "$lines" -gt 0 ]; then
+            SHAPEIT5_phase_common \
+                --input "${INPUTVCF}" \
+                --map "${MAP}" \
+                --region "${REGION}" \
+                --output "${OUTDIR}/chr${CHR}_${REGION}.phased.bcf" \
+                --thread "${THREAD}" \
+                --log "${LOGDIR}/chr${CHR}_${REGION}.log"
+        else
+            echo "⚠️  REGION ${REGION} has 0 SNPs, skipping..."
+        fi
+    ' :::: "${CHUNKS}"
+
 done
 
 
@@ -216,30 +403,11 @@ for CHR in {1..22}; do
     bcftools index -c shapeit5/shapeit_chr/complete/merged_chr${CHR}.bcf
 done
 
-'''
-# sample 確認
-for CHR in {1..22}; do
-    bcftools view \
-      -S target_samples.txt \
-      -Ob -o shapeit5/shapeit_chr/complete/merged_chr${CHR}.target.bcf \
-      shapeit5/shapeit_chr/complete/merged_chr${CHR}.bcf
-    
-    bcftools index -c shapeit5/shapeit_chr/complete/merged_chr${CHR}.target.bcf
-
-    echo -n "chr${CHR}: "
-    bcftools view -H shapeit5/shapeit_chr/complete/merged_chr${CHR}.target.bcf | wc -l
-done
-'''
 for CHR in {1..22}; do
     bcftools view -H shapeit5/shapeit_chr/complete/merged_chr${CHR}.bcf | wc -l
     bcftools query -l shapeit5/shapeit_chr/complete/merged_chr${CHR}.bcf | wc -l
 done
 
-for CHR in {1..22}; do
-    bcftools view -Oz -o shapeit5/shapeit_chr/complete/merged_chr${CHR}.target.vcf.gz \
-        shapeit5/shapeit_chr/complete/merged_chr${CHR}.bcf
-    bcftools index -t shapeit5/shapeit_chr/complete/merged_chr${CHR}.target.vcf.gz
-done
 
 # chrx
 mkdir -p shapeit5/shapeit_chrx
@@ -247,7 +415,7 @@ mkdir -p shapeit5/shapeit_chrx/chrX
 mkdir -p shapeit5/shapeit_chrx/chrX_par1
 mkdir -p shapeit5/shapeit_chrx/chrX_par2
 mkdir -p shapeit5/shapeit_chrx/complete
-CHR=X
+
 
 # nonpar divide male and female
 # female phasing
@@ -374,7 +542,7 @@ tabix -p vcf shapeit5/shapeit_chrx/complete/chrX_male_nonpar.vcf.gz
          # 修改 GT
          if(gt=="0|0" || gt=="0/0") a[1]="0"
          else if(gt=="1|1" || gt=="1/1") a[1]="1"
-         else if(gt=="0|1" || gt=="1|0") a[1]="1"
+         else if(gt=="0|1" || gt=="1|0") a[1]="."
          else if(gt==".|." || gt=="./.") a[1]="."
 
          # 重組 sample
@@ -399,17 +567,16 @@ for REGION_TYPE in chrX; do
       --haploids male_samples.txt\
       --map ${MAP} \
       --region chrX \
-      --output shapeit5/shapeit_chrx/${REGION_TYPE}/${REGION_TYPE}_nonpar_male_haploids.phased.vcf.gz \
+      --output shapeit5/shapeit_chrx/${REGION_TYPE}/${REGION_TYPE}_nonpar_male_haploids.phased.bcf \
       --thread 10 \
       --log shapeit5/logs/chrX_nonpar_male_haploids.log
 done
-bcftools index -t shapeit5/shapeit_chrx/complete/chrX_nonpar_male_haploids.phased.vcf.gz
 
 
 # merge nonpar
 bcftools merge -Oz -o shapeit5/shapeit_chrx/complete/chrX_3.vcf.gz \
   shapeit5/shapeit_chrx/complete/chrX_1.bcf \
-  shapeit5/shapeit_chrx/complete/chrX_nonpar_male_haploids.phased.vcf.gz
+  shapeit5/shapeit_chrx/chrX/chrX_nonpar_male_haploids.phased.bcf
 bcftools index -c shapeit5/shapeit_chrx/complete/chrX_3.vcf.gz
 
 bcftools query -l shapeit5/shapeit_chrx/complete/chrX_par1_1.bcf > chrX_order.txt
@@ -418,249 +585,36 @@ bcftools index -c shapeit5/shapeit_chrx/complete/chrX_3.sorted.vcf.gz
 
 
 # concat
-bcftools concat -Ob -o shapeit5/shapeit_chr/complete/merged_chrX.target.bcf \
+bcftools concat -Ob -o shapeit5/shapeit_chr/complete/merged_chrX.target.vcf.gz \
   shapeit5/shapeit_chrx/complete/chrX_par1_1.bcf \
   shapeit5/shapeit_chrx/complete/chrX_3.sorted.vcf.gz \
   shapeit5/shapeit_chrx/complete/chrX_par2_1.bcf
-bcftools index -c shapeit5/shapeit_chr/complete/merged_chrX.target.bcf
+bcftools index -c shapeit5/shapeit_chr/complete/merged_chrX.target.vcf.gz
 
 
 for CHR in X; do
     bcftools view -H shapeit5/shapeit_chr/complete/merged_chr${CHR}.target.bcf | wc -l
     bcftools query -l shapeit5/shapeit_chr/complete/merged_chr${CHR}.target.bcf | wc -l
 done
+
 #CHECK
 bcftools view -H cleaned_chrX_merged_singletonremoved2.vcf.gz | wc -l
 bcftools query -l cleaned_chrX_merged_singletonremoved2.vcf.gz | wc -l
 
-for CHR in X; do
-    bcftools view -Oz -o shapeit5/shapeit_chr/complete/merged_chr${CHR}.target.vcf.gz \
-        shapeit5/shapeit_chr/complete/merged_chr${CHR}.target.bcf
-    bcftools index -t shapeit5/shapeit_chr/complete/merged_chr${CHR}.target.vcf.gz
+for CHR in {1..22} X; do
+    if [[ "$CHR" == "X" ]]; then
+        INFILE="shapeit5/shapeit_chr/complete/merged_chrX.target.bcf"
+    else
+        INFILE="shapeit5/shapeit_chr/complete/merged_chr${CHR}.bcf"
+    fi
+
+    OUTFILE="shapeit5/shapeit_chr/complete/${output}_merged_chr${CHR}.target.vcf.gz"
+
+    echo "Processing chr${CHR} ..."
+    bcftools view -Oz -o "${OUTFILE}" "${INFILE}"
+    bcftools index -t "${OUTFILE}"
 done
 
-
-
-
-
-"""
-# debug
-CHR=15
-echo "Phasing chr${CHR}..."
-MAP=/home/Weber/hg38_chr/chr${CHR}.chrprefix.b38.gmap.gz
-for groupfile in group_phasing/${CHR}_samples_group_*; do
-    [[ $groupfile == *.csi ]] && continue
-
-    group=$(basename "$groupfile" .vcf.gz)
-    echo "GROUP $group..."
-    while read REGION; do
-        echo "  REGION ${REGION}"
-        lines=$(bcftools view -r ${REGION} -H group_phasing/${group}.vcf.gz | wc -l)
-        echo " SNP count: $lines "
-        outfile="shapeit_chr4/chr${group}_${REGION}.phased.vcf.gz"
-        if [ ! -f "$outfile" ]; then
-            echo "  → Running shapeit4 for ${REGION}"
-            shapeit4 \
-              --input group_phasing/${group}.vcf.gz \
-              --map ${MAP} \
-              --region ${REGION} \
-              --output "$outfile" \
-              --thread 5 \
-              --pbwt-depth 1 \
-              --window 3.5 \
-              --sequencing \
-              --log shapeit_chr4/logs/${group}_${REGION}.log
-        else
-            echo "  → Skipping ${REGION} (already done)"
-        fi
-    done < <(cat phasing/chr${CHR}.chunks.txt)
-done
-
-echo "Concatenating groups in chr${CHR}..."
-for groupfile in group_phasing/${CHR}_samples_group_*; do
-    [[ $groupfile == *.csi ]] && continue
-    group=$(basename "$groupfile" .vcf.gz)
-    echo "concat ${group}"
-    bcftools concat -Oz -o shapeit_chr4/merged_${group}.vcf.gz \
-$(awk -v grp="$group" '{print "shapeit_chr4/chr" grp "_" $1 ".phased.vcf.gz"}' phasing/chr${CHR}.chunks.txt)
-    bcftools index -c shapeit_chr4/merged_${group}.vcf.gz
-done
-
-
-echo "Merging chr${CHR}..."
-bcftools merge --force-samples -Oz -o shapeit_chr4/merged_chr${CHR}.vcf.gz \
-    shapeit_chr4/merged_${CHR}_samples_group_*.vcf.gz
-bcftools index -c shapeit_chr4/merged_chr${CHR}.vcf.gz
-
-bcftools query -l shapeit_chr4/merged_chr${CHR}.target.vcf.gz | wc -l
-
-
-for CHR in {1..22}; do
-    bcftools view \
-      -S target_samples.txt \
-      -Oz -o temp/merged_chr${CHR}.target.vcf.gz \
-      temp/merged_chr${CHR}.vcf.gz
-    
-    bcftools index -c temp/merged_chr${CHR}.target.vcf.gz
-
-    echo -n "chr${CHR}: "
-    bcftools view -H temp/merged_chr${CHR}.target.vcf.gz | wc -l
-done
-
-
-# debug'
-
-MAP=/home/Weber/hg38_chr/chr7.chrprefix.b38.gmap.gz
-shapeit4 \
-  --input group_phasing/7_samples_group_ak.vcf.gz \
-  --map ${MAP} \
-  --region chr7:77477480-80428848 \
-  --output shapeit_chr4/chr7_samples_group_ab_chr7:77477480-80428848.phased.vcf.gz \
-  --thread 2 \
-  --pbwt-depth 1 \
-  --window 2.0 \
-  --sequencing \
-  --log shapeit_chr4/logs/chr7_samples_group_ab_chr7:77477480-80428848.log
-
-bcftools view -H shapeit_chr4/chr7_samples_group_ab_chr7:77477480-80428848_debug.phased.vcf.gz | wc -l
-bcftools view -H shapeit_chr4/chr7_samples_group_ab_chr7:77477480-80428848.phased.vcf.gz | wc -l
-bcftools view -H shapeit_chr4/chr7_samples_group_ak_chr7:77477480-80428848_debug.phased.vcf.gz | wc -l
-bcftools view -H shapeit_chr4/chr7_samples_group_ak_chr7:77477480-80428848.phased.vcf.gz | wc -l
-MAP=/home/Weber/hg38_chr/chr${CHR}.chrprefix.b38.gmap.gz
-chr7:77477480-80428848
-shapeit_chr4/group/merged_7_samples_group_ak.vcf.gz
-shapeit_chr4/chr7_samples_group_ak_chr7:77477480-80428848.phased.vcf.gz
-
-for CHR in 7; do
-    echo "Phasing chr${CHR}..."
-    MAP=/home/Weber/hg38_chr/chr${CHR}.chrprefix.b38.gmap.gz
-    for group in 7_samples_group_ab; do
-        echo "GROUP $group..."
-        while read REGION; do
-            echo "  REGION ${REGION}"
-            lines=$(bcftools view -r ${REGION} -H group_phasing/${group}.vcf.gz | wc -l)
-            echo " SNP count: $lines "
-            shapeit4 \
-              --input group_phasing/${group}.vcf.gz \
-              --map ${MAP} \
-              --region ${REGION} \
-              --output shapeit_chr4/chr${group}_${REGION}.phased.vcf.gz \
-              --thread 2 \
-              --pbwt-depth 1 \
-              --window 2.0 \
-              --sequencing \
-              --log shapeit_chr4/logs/${group}_${REGION}.log
-        done < <(cat phasing/chr${CHR}.chunks.txt)
-    done
-done
-# Step1: concat 每個 group 的 chunks
-for CHR in 7; do
-    echo "Concatenating groups in chr${CHR}..."
-    for groupfile in group_phasing/${CHR}_samples_group_*; do
-        [[ $groupfile == *.csi ]] && continue
-        group=$(basename "$groupfile" .vcf.gz)
-        echo "concat ${group}"
-        bcftools concat -Oz -o shapeit_chr4/group/merged_${group}.vcf.gz \
-  $(awk -v grp="$group" '{print "shapeit_chr4/chr" grp "_" $1 ".phased.vcf.gz"}' phasing/chr${CHR}.chunks.txt)
-        bcftools index -c shapeit_chr4/group/merged_${group}.vcf.gz
-    done
-done
-
-
-# Step2: merge 每條 chr 的所有 group
-for CHR in 7; do
-    echo "Merging chr${CHR}..."
-    bcftools merge --force-samples -Oz -o shapeit_chr4/complete/merged_chr${CHR}.vcf.gz \
-        shapeit_chr4/group/merged_${CHR}_samples_group_*.vcf.gz
-    bcftools index -c shapeit_chr4/complete/merged_chr${CHR}.vcf.gz
-done
-
-# sample 確認
-for CHR in 7; do
-    bcftools view \
-      -S target_samples.txt \
-      -Oz -o shapeit_chr4/complete/merged_chr${CHR}.target.vcf.gz \
-      shapeit_chr4/complete/merged_chr${CHR}.vcf.gz
-    
-    bcftools index -c shapeit_chr4/complete/merged_chr${CHR}.target.vcf.gz
-
-    echo -n "chr${CHR}: "
-    bcftools view -H shapeit_chr4/complete/merged_chr${CHR}.target.vcf.gz | wc -l
-done
-
-
-###parallel
-
-#!/bin/bash
-
-THREAD=10
-
-for CHR in {1..2}; do
-    echo "==> Phasing chr${CHR} with GNU parallel..."
-    MAP=/home/Weber/hg38_chr/chr${CHR}.chrprefix.b38.gmap.gz
-    INPUT=phasing/chr${CHR}.vcf.gz
-    CHUNKS=shapeit5/phasing/chr${CHR}.chunks.txt
-    OUTDIR=shapeit5/shapeit_chr
-    LOGDIR=shapeit5/logs
-
-    mkdir -p ${OUTDIR}/test ${LOGDIR}
-
-    export CHR MAP INPUT OUTDIR LOGDIR THREAD
-
-    # 使用 parallel 執行每個 REGION
-    cat ${CHUNKS} | grep -v '^$' | parallel -j ${THREAD} "
-        REGION={}
-        echo '  REGION ${REGION}'
-        lines=\$(bcftools view -r \${REGION} -H ${INPUT} | wc -l)
-        echo '  SNP count: '\$lines
-
-        if [ \$lines -gt 0 ]; then
-            SHAPEIT5_phase_common \
-              --input ${INPUT} \
-              --map ${MAP} \
-              --region \${REGION} \
-              --output ${OUTDIR}/test/chr${CHR}_\${REGION}.phased.bcf \
-              --thread 5 \
-              --log ${LOGDIR}/chr${CHR}_\${REGION}.log
-        else
-            echo '⚠️  REGION \${REGION} has 0 SNPs, skipping...'
-        fi
-    "
-done
-
-
-mkdir -p shapeit5/shapeit_chr/complete
-
-# 1️⃣ 平行 concat 每條 chr 的 chunk
-# 將每個 chr 的工作封裝成函數
-merge_chr() {
-    CHR=$1
-    echo "Merging chr${CHR}..."
-
-    # 生成 chunk 檔案清單，依 phasing/chr${CHR}.chunks.txt 排序
-    chunks=$(awk -v chr=${CHR} '{print "shapeit5/shapeit_chr/chr" chr "_" $1 ".phased.bcf"}' shapeit5/phasing/chr${CHR}.chunks.txt)
-
-    # concat 並排序，輸出到 complete
-    bcftools concat -Ob $chunks | bcftools sort -Ob -o shapeit5/shapeit_chr/complete/merged_chr${CHR}.bcf
-
-    # 建立索引
-    bcftools index -c shapeit5/shapeit_chr/complete/merged_chr${CHR}.bcf
-}
-
-export -f merge_chr
-
-# 用 parallel 處理多個 chr，這裡同時跑 5 個 chr
-parallel -j 5 merge_chr ::: {1..22}
-'
-
-# 2️⃣ 平行篩 target samples 並 index
-seq 1 22 | parallel -j 5 '
-CHR={}
-echo -n "chr${CHR}: "
-bcftools view -H shapeit5/shapeit_chr/complete/merged_chr${CHR}.bcf | wc -l
-bcftools query -l shapeit5/shapeit_chr/complete/merged_chr${CHR}.bcf | wc -l
-bcftools view -Oz -o shapeit5/shapeit_chr/complete/merged_chr${CHR}.target.vcf.gz \
-    shapeit5/shapeit_chr/complete/merged_chr${CHR}.bcf
-bcftools index -t shapeit5/shapeit_chr/complete/merged_chr${CHR}.target.vcf.gz
-'
-"""
+###
+# shapeit5 --> phase_common(MAF>0.1%) > phase_common(related,haploids,MAF>0.1%) > phase_rare(scaffold)
+###
